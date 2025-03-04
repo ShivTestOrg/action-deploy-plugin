@@ -176,14 +176,27 @@ runs:
               return new Promise(resolve => setTimeout(resolve, ms));
             }
 
-            async function retryWithBackoff(operation, maxRetries = 3) {
+            async function retryWithBackoff(operation, maxRetries = 5) {
               for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                   return await operation();
                 } catch (error) {
-                  if (attempt === maxRetries) throw error;
-                  const delayMs = Math.min(1000 * Math.pow(2, attempt), 10000);
-                  console.log('Attempt ' + attempt + ' failed, retrying in ' + delayMs + 'ms...');
+                  const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
+                  console.error(`Attempt ${attempt} failed: ${errorMessage}`);
+                  
+                  if (attempt === maxRetries) {
+                    console.error('Maximum retries reached. Failing operation.');
+                    throw error;
+                  }
+                  
+                  // Exponential backoff with jitter
+                  const baseDelay = 1000;
+                  const maxDelay = 30000; // 30 seconds max delay
+                  const exponentialDelay = baseDelay * Math.pow(2, attempt - 1);
+                  const jitter = Math.random() * 1000;
+                  const delayMs = Math.min(exponentialDelay + jitter, maxDelay);
+                  
+                  console.log(`Retrying in ${Math.round(delayMs)}ms...`);
                   await sleep(delayMs);
                 }
               }
@@ -227,8 +240,8 @@ runs:
                   });
                 }
 
-                const chunkSize = 10;
-                const maxChunkBytes = 500 * 1024; // 500KB max per chunk
+                const chunkSize = 5;
+                const maxChunkBytes = 250 * 1024;
                 const treeEntryChunks = [];
                 let currentChunk = [];
                 let currentChunkSize = 0;
@@ -252,33 +265,48 @@ runs:
                   treeEntryChunks.push(currentChunk);
                 }
 
-                console.log('Processing ' + allTreeEntries.length + ' files in ' + treeEntryChunks.length + ' chunks');
+                const totalBytes = allTreeEntries.reduce((acc, entry) => acc + Buffer.byteLength(entry.content, 'utf8'), 0);
+                console.log(`Processing ${allTreeEntries.length} files (total size: ${Math.round(totalBytes/1024)}KB) in ${treeEntryChunks.length} chunks`);
 
                 let currentTreeSha = currentCommit.data.object.sha;
                 for (let i = 0; i < treeEntryChunks.length; i++) {
                   const chunk = treeEntryChunks[i];
                   const chunkIndex = i + 1;
-                  console.log('Processing chunk ' + chunkIndex + ' of ' + treeEntryChunks.length + ' (' + chunk.length + ' files)');
+                  const chunkBytes = chunk.reduce((acc, entry) => acc + Buffer.byteLength(entry.content, 'utf8'), 0);
+                  console.log(`Processing chunk ${chunkIndex} of ${treeEntryChunks.length} (${chunk.length} files, ${Math.round(chunkBytes/1024)}KB)`);
                   
-                  try {
-                    const newTree = await retryWithBackoff(() => 
-                      octokit.rest.git.createTree({
-                        owner,
-                        repo,
-                        base_tree: currentTreeSha,
-                        tree: chunk,
-                      })
-                    );
-                    
-                    currentTreeSha = newTree.data.sha;
-                    console.log('Successfully processed chunk ' + chunkIndex);
-                  } catch (error) {
-                    if (error.message) {
-                      console.error('Error processing chunk ' + chunkIndex + ': ' + error.message);
-                    } else {
-                      console.error('Error processing chunk ' + chunkIndex + ': Unknown error');
+                  let retryCount = 0;
+                  const maxRetries = 3;
+                  
+                  while (retryCount <= maxRetries) {
+                    try {
+                      const newTree = await retryWithBackoff(() => 
+                        octokit.rest.git.createTree({
+                          owner,
+                          repo,
+                          base_tree: currentTreeSha,
+                          tree: chunk,
+                        })
+                      );
+                      
+                      currentTreeSha = newTree.data.sha;
+                      console.log(`Successfully processed chunk ${chunkIndex}`);
+                      break; // Success, exit retry loop
+                      
+                    } catch (error) {
+                      retryCount++;
+                      const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
+                      console.error(`Error processing chunk ${chunkIndex} (attempt ${retryCount}/${maxRetries + 1}): ${errorMessage}`);
+                      
+                      if (retryCount > maxRetries) {
+                        throw error; // Max retries exceeded, propagate error
+                      }
+                      
+                      // Wait longer between chunk retries
+                      const delayMs = Math.min(10000 * Math.pow(2, retryCount - 1), 30000);
+                      console.log(`Waiting ${Math.round(delayMs/1000)}s before retrying chunk...`);
+                      await sleep(delayMs);
                     }
-                    throw error;
                   }
                 }
 
