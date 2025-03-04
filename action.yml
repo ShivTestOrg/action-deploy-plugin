@@ -172,9 +172,25 @@ runs:
             const glob = require('glob');
             const manifestPath = path.relative('.', '${{ inputs.manifestPath }}');
 
+            async function sleep(ms) {
+              return new Promise(resolve => setTimeout(resolve, ms));
+            }
+
+            async function retryWithBackoff(operation, maxRetries = 3) {
+              for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  if (attempt === maxRetries) throw error;
+                  const delayMs = Math.min(1000 * Math.pow(2, attempt), 10000);
+                  console.log(`Attempt ${attempt} failed, retrying in ${delayMs}ms...`);
+                  await sleep(delayMs);
+                }
+              }
+            }
+
             async function pushChanges() {
               const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
-
               const context = github.context;
               const owner = context.repo.owner;
               const repo = context.repo.repo;
@@ -187,10 +203,11 @@ runs:
                   ref
                 });
 
+                // Prepare all tree entries
                 console.log('Adding file:', manifestPath);
                 const distPath = '${{ github.workspace }}/dist/';
                 const distFiles = glob.sync(distPath + '**/*.{js,cjs,map,json}');
-                const treeEntries = [
+                const allTreeEntries = [
                   {
                     path: manifestPath,
                     mode: '100644',
@@ -198,38 +215,85 @@ runs:
                     content: fs.readFileSync(manifestPath, 'utf8'),
                   }
                 ];
+
                 for (const file of distFiles) {
                   const relativePath = path.relative('.', file);
                   console.log('Adding file:', relativePath);
-                  treeEntries.push({
+                  allTreeEntries.push({
                     path: relativePath,
                     mode: '100644',
                     type: 'blob',
                     content: fs.readFileSync(file, 'utf8'),
                   });
                 }
-                const newTree = await octokit.rest.git.createTree({
-                  owner,
-                  repo,
-                  base_tree: currentCommit.data.object.sha,
-                  tree: treeEntries,
-                });
 
-                const newCommit = await octokit.rest.git.createCommit({
+                const chunkSize = 10;
+                const maxChunkBytes = 500 * 1024; // 500KB max per chunk
+                const treeEntryChunks = [];
+                let currentChunk = [];
+                let currentChunkSize = 0;
+
+                for (const entry of allTreeEntries) {
+                  const entrySize = Buffer.byteLength(entry.content, 'utf8');
+                  
+                  if (currentChunk.length >= chunkSize || currentChunkSize + entrySize > maxChunkBytes) {
+                    if (currentChunk.length > 0) {
+                      treeEntryChunks.push(currentChunk);
+                      currentChunk = [];
+                      currentChunkSize = 0;
+                    }
+                  }
+                  
+                  currentChunk.push(entry);
+                  currentChunkSize += entrySize;
+                }
+
+                if (currentChunk.length > 0) {
+                  treeEntryChunks.push(currentChunk);
+                }
+
+                console.log(`Splitting ${allTreeEntries.length} files into ${treeEntryChunks.length} chunks`);
+
+                let currentTreeSha = currentCommit.data.object.sha;
+                for (let i = 0; i < treeEntryChunks.length; i++) {
+                  const chunk = treeEntryChunks[i];
+                  console.log(`Processing chunk ${i + 1}/${treeEntryChunks.length} (${chunk.length} files)`);
+                  
+                  try {
+                    const newTree = await retryWithBackoff(() => 
+                      octokit.rest.git.createTree({
+                        owner,
+                        repo,
+                        base_tree: currentTreeSha,
+                        tree: chunk,
+                      })
+                    );
+                    
+                    currentTreeSha = newTree.data.sha;
+                    console.log(`Successfully processed chunk ${i + 1}`);
+                  } catch (error) {
+                    console.error(`Error processing chunk ${i + 1}:`, error);
+                    throw error; // Re-throw to trigger overall error handling
+                  }
+                }
+
+                console.log('Creating commit...');
+                const newCommit = await retryWithBackoff(() => octokit.rest.git.createCommit({
                   owner,
                   repo,
                   message: '${{ inputs.commitMessage }}',
-                  tree: newTree.data.sha,
+                  tree: currentTreeSha,
                   parents: [currentCommit.data.object.sha]
-                });
+                }));
 
-                await octokit.rest.git.updateRef({
+                await retryWithBackoff(() => octokit.rest.git.updateRef({
                   owner,
                   repo,
                   ref,
                   sha: newCommit.data.sha,
                   force: true
-                });
+                }));
+                console.log('Repository reference updated successfully');
 
                 console.log('Changes pushed successfully');
               } catch (error) {
