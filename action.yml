@@ -185,15 +185,44 @@ runs:
         git checkout --orphan temp_branch
         git rm -rf .
 
-        # Copy files to staging
+        # Copy files to staging with proper path handling
         echo "Copying files..."
         mkdir -p dist
-        cp "${{ github.workspace }}/${{ inputs.manifestPath }}" .
-        cp -r "${{ github.workspace }}/dist/"* dist/
-
-        # Stage and commit all files
-        echo "Creating commit..."
-        git add -f "${{ inputs.manifestPath }}" dist/
+        
+        # First save current directory
+        CURRENT_DIR=$(pwd)
+        cd "${{ github.workspace }}"
+        
+        # Debug info
+        echo "Current workspace contents:"
+        ls -la
+        
+        # Handle manifest file
+        echo "Copying manifest file..."
+        if [ -f "manifest.json" ]; then
+            cp manifest.json "$CURRENT_DIR/"
+            echo "Manifest file copied successfully"
+        else
+            echo "Error: manifest.json not found in workspace root"
+            exit 1
+        fi
+        
+        # Handle dist directory
+        echo "Copying dist directory..."
+        if [ -d "dist" ] && [ -n "$(ls -A dist)" ]; then
+            cp -r dist "$CURRENT_DIR/"
+            echo "Dist directory copied successfully"
+        else
+            echo "Error: dist directory not found or empty"
+            exit 1
+        fi
+        
+        # Return to working directory
+        cd "$CURRENT_DIR"
+        
+        # Stage the files
+        echo "Staging files..."
+        git add -f manifest.json dist/
 
         # Only proceed if there are changes
         if git status --porcelain | grep -q '^'; then
