@@ -166,91 +166,49 @@ runs:
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
-        # Create a temporary directory for the clone
-        TEMP_DIR=$(mktemp -d)
-        echo "Created temporary directory: $TEMP_DIR"
-
-        # Clone the repository
-        echo "Cloning repository to temporary directory..."
-        git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$TEMP_DIR"
-        cd "$TEMP_DIR"
-
-        # Store the current branch name
-        CURRENT_BRANCH="${{ github.ref_name }}"
-        
-        # Function to ensure cleanup happens even on error
+        # Function to ensure cleanup on error
         cleanup() {
           echo "Cleaning up..."
-          git push origin --delete temp_staging || true
-          cd "${{ github.workspace }}"
-          rm -rf "$TEMP_DIR"
+          git checkout "${{ github.ref_name }}" || true
+          git branch -D temp_branch 2>/dev/null || true
         }
-        trap cleanup EXIT
+        trap cleanup ERR EXIT
 
-        # Create an orphan branch to stage files
+        # Configure git remote with token
+        git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+        
+        # Store any uncommitted changes
+        git stash -u || true
+
+        # Create orphan branch for staging
         echo "Creating temporary orphan branch..."
-        git checkout --orphan temp_staging
-        
-        # Clean the working directory in the orphan branch
+        git checkout --orphan temp_branch
         git rm -rf .
-        
-        # Create empty directories
+
+        # Copy files to staging
+        echo "Copying files..."
         mkdir -p dist
-
-        # Copy and commit manifest first
-        echo "Processing manifest.json..."
         cp "${{ github.workspace }}/${{ inputs.manifestPath }}" .
-        git add "${{ inputs.manifestPath }}"
-        git commit -m "Add manifest.json"
-        git push origin temp_staging
-
-        # Process dist files in batches
-        echo "Processing dist folder files..."
-        
-        # First, copy all dist files
         cp -r "${{ github.workspace }}/dist/"* dist/
-        
-        # Get total number of files for progress reporting
-        TOTAL_FILES=$(find dist -type f | wc -l)
-        PROCESSED_FILES=0
-        BATCH_SIZE=5
-        CURRENT_BATCH=0
-        
-        # Process files in batches
-        find dist -type f -print0 | sort -z | while IFS= read -r -d '' file; do
-          REL_PATH=$(realpath --relative-to="$PWD" "$file")
-          ((PROCESSED_FILES++))
-          ((CURRENT_BATCH++))
-          
-          echo "[${PROCESSED_FILES}/${TOTAL_FILES}] Adding file: $REL_PATH"
-          git add -f "$REL_PATH"
-          
-          if [ $CURRENT_BATCH -ge $BATCH_SIZE ] || [ $PROCESSED_FILES -eq $TOTAL_FILES ]; then
-            echo "Creating batch commit (files ${PROCESSED_FILES-CURRENT_BATCH+1}-${PROCESSED_FILES})..."
-            git commit -m "Add dist files batch ${PROCESSED_FILES-CURRENT_BATCH+1}-${PROCESSED_FILES}"
-            git push origin temp_staging
-            CURRENT_BATCH=0
-            echo "Batch pushed successfully"
-          fi
-        done || exit 1  # Ensure script fails if the loop fails
 
-        # Verify all files were processed
-        if [ $PROCESSED_FILES -ne $TOTAL_FILES ]; then
-          echo "Error: Not all files were processed ($PROCESSED_FILES of $TOTAL_FILES)"
-          exit 1
-        fi
+        # Stage and commit all files
+        echo "Creating commit..."
+        git add -f "${{ inputs.manifestPath }}" dist/
 
-        # Switch back to the original branch and create final commit
-        echo "Creating final commit on $CURRENT_BRANCH..."
-        git checkout "$CURRENT_BRANCH"
-        git add "${{ inputs.manifestPath }}"
-        git add -f dist/
-        
-        # Only commit if there are changes
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-        else
+        # Only proceed if there are changes
+        if git status --porcelain | grep -q '^'; then
+          # Create commit with all files
           git commit -m "${{ inputs.commitMessage }}"
-          git push origin "$CURRENT_BRANCH"
+
+          # Reset main branch to this new commit
+          echo "Updating ${{ github.ref_name }}..."
+          git push origin temp_branch:${{ github.ref_name }} --force
+
           echo "Changes pushed successfully"
+        else
+          echo "No changes to commit"
         fi
+
+        # Switch back and restore any stashed changes
+        git checkout "${{ github.ref_name }}"
+        git stash pop || true
