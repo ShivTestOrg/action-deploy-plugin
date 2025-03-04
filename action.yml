@@ -162,7 +162,7 @@ runs:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
         git add "${{ inputs.manifestPath }}"
-        find ${{ github.workspace }}/dist \( -name "*.js" -o -name "*.cjs" -o -name "*.map" -o -name "*.json" \) -print0 | xargs -0 git add -f
+        find ${{ github.workspace }}/dist \( -name "*.js" -o -name "*.cjs" -o -name "*.map" -o -name "*.json" \) -type f -print0 | xargs -0 git add -f || true
         echo "Changed files:"
         echo "$(git diff-index --cached --name-only HEAD)"
         if [ -n "$(git diff-index --cached --name-only HEAD)" ]; then
@@ -242,10 +242,13 @@ runs:
 
                   const chunkNumber = Math.floor(i / CHUNK_SIZE) + 1;
                   const totalChunks = Math.ceil(distFiles.length / CHUNK_SIZE);
+                  const commitMessage = 'chore: update dist files (part ' + chunkNumber + '/' + totalChunks + ')';
+                  console.log('Creating commit:', commitMessage);
+                  
                   const newCommit = await octokit.rest.git.createCommit({
                     owner,
                     repo,
-                    message: `chore: update dist files (part ${chunkNumber}/${totalChunks})`,
+                    message: commitMessage,
                     tree: newTree.data.sha,
                     parents: [lastCommitSha]
                   });
