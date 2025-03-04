@@ -1,3 +1,4 @@
+
 name: "Update Manifest and Commit Changes"
 description: "Checks out the repository, sets up Node, installs dependencies, updates manifest.json, formats, and commits/pushes changes signing the commit."
 inputs:
@@ -155,89 +156,121 @@ runs:
       run: |
         bun add "@actions/github" glob
 
-    - name: Configure Git
-      shell: bash
-      run: |
-        git config --global user.name "github-actions"
-        git config --global user.email "github-actions@github.com"
-
     - name: Update manifest.json and dist folder
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
-        # Function to ensure cleanup on error
-        cleanup() {
-          echo "Cleaning up..."
-          git checkout "${{ github.ref_name }}" || true
-          git branch -D temp_branch 2>/dev/null || true
-        }
-        trap cleanup ERR EXIT
+        git add "${{ inputs.manifestPath }}"
+        find ${{ github.workspace }}/dist \( -name "*.js" -o -name "*.cjs" -o -name "*.map" -o -name "*.json" \) -print0 | xargs -0 git add -f
+        echo "Changed files:"
+        echo "$(git diff-index --cached --name-only HEAD)"
+        if [ -n "$(git diff-index --cached --name-only HEAD)" ]; then
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const github = require('@actions/github');
+            const glob = require('glob');
+            const manifestPath = path.relative('.', '${{ inputs.manifestPath }}');
 
-        # Configure git remote with token
-        git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-        
-        # Store any uncommitted changes
-        git stash -u || true
+            async function pushChangesInChunks() {
+              const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
+              const context = github.context;
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const ref = 'heads/${{ github.ref_name }}';
 
-        # Create orphan branch for staging
-        echo "Creating temporary orphan branch..."
-        git checkout --orphan temp_branch
-        git rm -rf .
+              try {
+                const currentCommit = await octokit.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref
+                });
 
-        # Copy files to staging with proper path handling
-        echo "Copying files..."
-        mkdir -p dist
-        
-        # First save current directory
-        CURRENT_DIR=$(pwd)
-        cd "${{ github.workspace }}"
-        
-        # Debug info
-        echo "Current workspace contents:"
-        ls -la
-        
-        # Handle manifest file
-        echo "Copying manifest file..."
-        if [ -f "manifest.json" ]; then
-            cp manifest.json "$CURRENT_DIR/"
-            echo "Manifest file copied successfully"
-        else
-            echo "Error: manifest.json not found in workspace root"
-            exit 1
-        fi
-        
-        # Handle dist directory
-        echo "Copying dist directory..."
-        if [ -d "dist" ] && [ -n "$(ls -A dist)" ]; then
-            cp -r dist "$CURRENT_DIR/"
-            echo "Dist directory copied successfully"
-        else
-            echo "Error: dist directory not found or empty"
-            exit 1
-        fi
-        
-        # Return to working directory
-        cd "$CURRENT_DIR"
-        
-        # Stage the files
-        echo "Staging files..."
-        git add -f manifest.json dist/
+                let lastCommitSha = currentCommit.data.object.sha;
+                const CHUNK_SIZE = 50; // Maximum files per commit
 
-        # Only proceed if there are changes
-        if git status --porcelain | grep -q '^'; then
-          # Create commit with all files
-          git commit -m "${{ inputs.commitMessage }}"
+                console.log('Adding file:', manifestPath);
+                const distPath = '${{ github.workspace }}/dist/';
+                const distFiles = glob.sync(distPath + '**/*.{js,cjs,map,json}');
+                
+                // Add manifest file first in a separate commit
+                const manifestTree = await octokit.rest.git.createTree({
+                  owner,
+                  repo,
+                  base_tree: lastCommitSha,
+                  tree: [{
+                    path: manifestPath,
+                    mode: '100644',
+                    type: 'blob',
+                    content: fs.readFileSync(manifestPath, 'utf8'),
+                  }]
+                });
 
-          # Reset main branch to this new commit
-          echo "Updating ${{ github.ref_name }}..."
-          git push origin temp_branch:${{ github.ref_name }} --force
+                const manifestCommit = await octokit.rest.git.createCommit({
+                  owner,
+                  repo,
+                  message: 'chore: update manifest.json',
+                  tree: manifestTree.data.sha,
+                  parents: [lastCommitSha]
+                });
+                
+                lastCommitSha = manifestCommit.data.sha;
 
-          echo "Changes pushed successfully"
+                // Split dist files into chunks
+                for (let i = 0; i < distFiles.length; i += CHUNK_SIZE) {
+                  const chunk = distFiles.slice(i, i + CHUNK_SIZE);
+                  const treeEntries = [];
+                  
+                  for (const file of chunk) {
+                    const relativePath = path.relative('.', file);
+                    console.log('Adding file:', relativePath);
+                    treeEntries.push({
+                      path: relativePath,
+                      mode: '100644',
+                      type: 'blob',
+                      content: fs.readFileSync(file, 'utf8'),
+                    });
+                  }
+
+                  const newTree = await octokit.rest.git.createTree({
+                    owner,
+                    repo,
+                    base_tree: lastCommitSha,
+                    tree: treeEntries,
+                  });
+
+                  const chunkNumber = Math.floor(i / CHUNK_SIZE) + 1;
+                  const totalChunks = Math.ceil(distFiles.length / CHUNK_SIZE);
+                  const newCommit = await octokit.rest.git.createCommit({
+                    owner,
+                    repo,
+                    message: `chore: update dist files (part ${chunkNumber}/${totalChunks})`,
+                    tree: newTree.data.sha,
+                    parents: [lastCommitSha]
+                  });
+
+                  lastCommitSha = newCommit.data.sha;
+                }
+
+                // Update ref to point to the last commit
+                await octokit.rest.git.updateRef({
+                  owner,
+                  repo,
+                  ref,
+                  sha: lastCommitSha,
+                  force: true
+                });
+
+                console.log('All changes pushed successfully in chunks');
+              } catch (error) {
+                console.error('Error pushing changes:', error);
+                process.exit(1);
+              }
+            }
+
+            pushChangesInChunks();
+          "
         else
           echo "No changes to commit"
         fi
-
-        # Switch back and restore any stashed changes
-        git checkout "${{ github.ref_name }}"
-        git stash pop || true
