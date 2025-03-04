@@ -150,60 +150,65 @@ runs:
         app_id: ${{ env.APP_ID }}
         private_key: ${{ env.APP_PRIVATE_KEY }}
 
+    - name: Install dependencies for GitHub Auth
+      shell: bash
+      run: |
+        bun add "@actions/github" glob
+
     - name: Configure Git
       shell: bash
       run: |
         git config --global user.name "github-actions"
         git config --global user.email "github-actions@github.com"
 
-    - name: Install git-lfs
-      shell: bash
-      run: |
-        if ! command -v git-lfs &> /dev/null; then
-          curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
-          sudo apt-get install git-lfs
-        fi
-
     - name: Update manifest.json and dist folder
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
-        cd "${{ github.workspace }}"
-        
-        # Configure git
+        # Function to ensure cleanup on error
+        cleanup() {
+          echo "Cleaning up..."
+          git checkout "${{ github.ref_name }}" || true
+          git branch -D temp_branch 2>/dev/null || true
+        }
+        trap cleanup ERR EXIT
+
+        # Configure git remote with token
         git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
         
-        # Initialize Git LFS
-        git lfs install
-        
-        # Setup Git LFS tracking for large files
-        git lfs track "dist/**/*.js"
-        git lfs track "dist/**/*.map"
-        git add .gitattributes
-        
-        # Stage and commit the manifest file separately
-        git add "${{ inputs.manifestPath }}"
-        git commit -m "chore: update manifest.json"
-        
-        # Stage and commit dist files in chunks
-        echo "Adding dist files..."
+        # Store any uncommitted changes
+        git stash -u || true
+
+        # Create orphan branch for staging
+        echo "Creating temporary orphan branch..."
+        git checkout --orphan temp_branch
+        git rm -rf .
+
+        # Copy files to staging
+        echo "Copying files..."
         mkdir -p dist
-        
-        # Add dist files in smaller chunks
-        find dist -type f -name "*.js" -o -name "*.map" | while read file; do
-          git add "$file"
-          # Commit every few files to avoid large trees
-          if [ $(git status --porcelain | wc -l) -ge 10 ]; then
-            git commit -m "chore: add dist files (chunk)"
-          fi
-        done
-        
-        # Commit any remaining files
-        git status --porcelain | grep -q . && git commit -m "chore: add remaining dist files"
-        
-        # Push all changes
-        echo "Pushing changes to ${{ github.ref_name }}..."
-        git push origin HEAD:${{ github.ref_name }}
+        cp "${{ github.workspace }}/${{ inputs.manifestPath }}" .
+        cp -r "${{ github.workspace }}/dist/"* dist/
+
+        # Stage and commit all files
+        echo "Creating commit..."
+        git add -f "${{ inputs.manifestPath }}" dist/
+
+        # Only proceed if there are changes
+        if git status --porcelain | grep -q '^'; then
+          # Create commit with all files
+          git commit -m "${{ inputs.commitMessage }}"
+
+          # Reset main branch to this new commit
+          echo "Updating ${{ github.ref_name }}..."
+          git push origin temp_branch:${{ github.ref_name }} --force
+
+          echo "Changes pushed successfully"
+        else
+          echo "No changes to commit"
+        fi
+
+        # Switch back and restore any stashed changes
+        git checkout "${{ github.ref_name }}"
+        git stash pop || true
