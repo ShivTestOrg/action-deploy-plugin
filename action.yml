@@ -155,188 +155,56 @@ runs:
       run: |
         bun add "@actions/github" glob
 
+    - name: Configure Git
+      shell: bash
+      run: |
+        git config --global user.name "github-actions"
+        git config --global user.email "github-actions@github.com"
+
     - name: Update manifest.json and dist folder
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
+        # Create a temporary directory for the clone
+        TEMP_DIR=$(mktemp -d)
+        echo "Created temporary directory: $TEMP_DIR"
+
+        # Clone the repository
+        echo "Cloning repository to temporary directory..."
+        git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$TEMP_DIR"
+        cd "$TEMP_DIR"
+        git checkout "${{ github.ref_name }}"
+
+        # Copy new/updated files
+        echo "Copying manifest.json..."
+        cp "${{ github.workspace }}/${{ inputs.manifestPath }}" .
+        
+        echo "Copying dist folder..."
+        mkdir -p dist
+        cp -r "${{ github.workspace }}/dist/"* dist/
+
+        # Stage changes
+        echo "Staging changes..."
         git add "${{ inputs.manifestPath }}"
-        find ${{ github.workspace }}/dist \( -name "*.js" -o -name "*.cjs" -o -name "*.map" -o -name "*.json" \) -print0 | xargs -0 git add -f
+        git add -f dist/
+
+        # Show changes to be committed
         echo "Changed files:"
-        echo "$(git diff-index --cached --name-only HEAD)"
-        if [ -n "$(git diff-index --cached --name-only HEAD)" ]; then
-          node -e "
-            const fs = require('fs');
-            const path = require('path');
-            const github = require('@actions/github');
-            const glob = require('glob');
-            const manifestPath = path.relative('.', '${{ inputs.manifestPath }}');
+        git status --porcelain
 
-            async function sleep(ms) {
-              return new Promise(resolve => setTimeout(resolve, ms));
-            }
-
-            async function retryWithBackoff(operation, maxRetries = 5) {
-              for (let attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                  return await operation();
-                } catch (error) {
-                  const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
-                  console.error(`Attempt ${attempt} failed: ${errorMessage}`);
-                  
-                  if (attempt === maxRetries) {
-                    console.error('Maximum retries reached. Failing operation.');
-                    throw error;
-                  }
-                  
-                  // Exponential backoff with jitter
-                  const baseDelay = 1000;
-                  const maxDelay = 30000; // 30 seconds max delay
-                  const exponentialDelay = baseDelay * Math.pow(2, attempt - 1);
-                  const jitter = Math.random() * 1000;
-                  const delayMs = Math.min(exponentialDelay + jitter, maxDelay);
-                  
-                  console.log(`Retrying in ${Math.round(delayMs)}ms...`);
-                  await sleep(delayMs);
-                }
-              }
-            }
-
-            async function pushChanges() {
-              const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
-              const context = github.context;
-              const owner = context.repo.owner;
-              const repo = context.repo.repo;
-              const ref = 'heads/${{ github.ref_name }}';
-
-              try {
-                const currentCommit = await octokit.rest.git.getRef({
-                  owner,
-                  repo,
-                  ref
-                });
-
-                // Prepare all tree entries
-                console.log('Adding file:', manifestPath);
-                const distPath = '${{ github.workspace }}/dist/';
-                const distFiles = glob.sync(distPath + '**/*.{js,cjs,map,json}');
-                const allTreeEntries = [
-                  {
-                    path: manifestPath,
-                    mode: '100644',
-                    type: 'blob',
-                    content: fs.readFileSync(manifestPath, 'utf8'),
-                  }
-                ];
-
-                for (const file of distFiles) {
-                  const relativePath = path.relative('.', file);
-                  console.log('Adding file:', relativePath);
-                  allTreeEntries.push({
-                    path: relativePath,
-                    mode: '100644',
-                    type: 'blob',
-                    content: fs.readFileSync(file, 'utf8'),
-                  });
-                }
-
-                const chunkSize = 5;
-                const maxChunkBytes = 250 * 1024;
-                const treeEntryChunks = [];
-                let currentChunk = [];
-                let currentChunkSize = 0;
-
-                for (const entry of allTreeEntries) {
-                  const entrySize = Buffer.byteLength(entry.content, 'utf8');
-                  
-                  if (currentChunk.length >= chunkSize || currentChunkSize + entrySize > maxChunkBytes) {
-                    if (currentChunk.length > 0) {
-                      treeEntryChunks.push(currentChunk);
-                      currentChunk = [];
-                      currentChunkSize = 0;
-                    }
-                  }
-                  
-                  currentChunk.push(entry);
-                  currentChunkSize += entrySize;
-                }
-
-                if (currentChunk.length > 0) {
-                  treeEntryChunks.push(currentChunk);
-                }
-
-                const totalBytes = allTreeEntries.reduce((acc, entry) => acc + Buffer.byteLength(entry.content, 'utf8'), 0);
-                console.log(`Processing ${allTreeEntries.length} files (total size: ${Math.round(totalBytes/1024)}KB) in ${treeEntryChunks.length} chunks`);
-
-                let currentTreeSha = currentCommit.data.object.sha;
-                for (let i = 0; i < treeEntryChunks.length; i++) {
-                  const chunk = treeEntryChunks[i];
-                  const chunkIndex = i + 1;
-                  const chunkBytes = chunk.reduce((acc, entry) => acc + Buffer.byteLength(entry.content, 'utf8'), 0);
-                  console.log(`Processing chunk ${chunkIndex} of ${treeEntryChunks.length} (${chunk.length} files, ${Math.round(chunkBytes/1024)}KB)`);
-                  
-                  let retryCount = 0;
-                  const maxRetries = 3;
-                  
-                  while (retryCount <= maxRetries) {
-                    try {
-                      const newTree = await retryWithBackoff(() => 
-                        octokit.rest.git.createTree({
-                          owner,
-                          repo,
-                          base_tree: currentTreeSha,
-                          tree: chunk,
-                        })
-                      );
-                      
-                      currentTreeSha = newTree.data.sha;
-                      console.log(`Successfully processed chunk ${chunkIndex}`);
-                      break; // Success, exit retry loop
-                      
-                    } catch (error) {
-                      retryCount++;
-                      const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
-                      console.error(`Error processing chunk ${chunkIndex} (attempt ${retryCount}/${maxRetries + 1}): ${errorMessage}`);
-                      
-                      if (retryCount > maxRetries) {
-                        throw error; // Max retries exceeded, propagate error
-                      }
-                      
-                      // Wait longer between chunk retries
-                      const delayMs = Math.min(10000 * Math.pow(2, retryCount - 1), 30000);
-                      console.log(`Waiting ${Math.round(delayMs/1000)}s before retrying chunk...`);
-                      await sleep(delayMs);
-                    }
-                  }
-                }
-
-                console.log('Creating commit...');
-                const newCommit = await retryWithBackoff(() => octokit.rest.git.createCommit({
-                  owner,
-                  repo,
-                  message: '${{ inputs.commitMessage }}',
-                  tree: currentTreeSha,
-                  parents: [currentCommit.data.object.sha]
-                }));
-
-                await retryWithBackoff(() => octokit.rest.git.updateRef({
-                  owner,
-                  repo,
-                  ref,
-                  sha: newCommit.data.sha,
-                  force: true
-                }));
-                console.log('Repository reference updated successfully');
-
-                console.log('Changes pushed successfully');
-              } catch (error) {
-                console.error('Error pushing changes:', error);
-                process.exit(1);
-              }
-            }
-
-            pushChanges();
-          "
+        # Commit and push if there are changes
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "Committing changes..."
+          git commit -m "${{ inputs.commitMessage }}"
+          
+          echo "Pushing changes..."
+          git push origin "${{ github.ref_name }}"
+          echo "Changes pushed successfully"
         else
           echo "No changes to commit"
         fi
+
+        # Cleanup
+        cd "${{ github.workspace }}"
+        rm -rf "$TEMP_DIR"
