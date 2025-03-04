@@ -150,11 +150,6 @@ runs:
         app_id: ${{ env.APP_ID }}
         private_key: ${{ env.APP_PRIVATE_KEY }}
 
-    - name: Install dependencies for GitHub Auth
-      shell: bash
-      run: |
-        bun add "@actions/github" glob
-
     - name: Configure Git
       shell: bash
       run: |
@@ -166,49 +161,86 @@ runs:
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
-        # Function to ensure cleanup on error
-        cleanup() {
-          echo "Cleaning up..."
-          git checkout "${{ github.ref_name }}" || true
-          git branch -D temp_branch 2>/dev/null || true
-        }
-        trap cleanup ERR EXIT
-
-        # Configure git remote with token
-        git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+        # Create new empty directory
+        TEMP_DIR=$(mktemp -d)
+        cd "$TEMP_DIR"
         
-        # Store any uncommitted changes
-        git stash -u || true
+        # Initialize git directory (not a repo)
+        mkdir .git
+        git init --bare
+        
+        # Ensure we exit on any error
+        set -e
 
-        # Create orphan branch for staging
-        echo "Creating temporary orphan branch..."
-        git checkout --orphan temp_branch
-        git rm -rf .
+        # Helper functions
+        create_blob() {
+          local file="$1"
+          if [ ! -f "$file" ]; then
+            echo "Error: File not found - $file" >&2
+            return 1
+          fi
+          git hash-object -w "$file"
+        }
 
-        # Copy files to staging
-        echo "Copying files..."
+        echo "Setting up git environment..."
+        mkdir -p .git/objects .git/refs
+
+        echo "Processing manifest file..."
+        MANIFEST_BLOB=$(create_blob "${{ github.workspace }}/${{ inputs.manifestPath }}")
+        echo "Manifest blob: $MANIFEST_BLOB"
+
+        # Create dist directory entries
+        echo "Processing dist files..."
         mkdir -p dist
-        cp "${{ github.workspace }}/${{ inputs.manifestPath }}" .
         cp -r "${{ github.workspace }}/dist/"* dist/
 
-        # Stage and commit all files
-        echo "Creating commit..."
-        git add -f "${{ inputs.manifestPath }}" dist/
+        # First create blobs for all dist files
+        echo "Creating file blobs..."
+        while IFS= read -r -d $'\0' file; do
+          rel_path="${file#./dist/}"
+          blob_hash=$(create_blob "$file")
+          # Use printf with tab delimiter to ensure proper spacing
+          printf "100644 blob %s\t%s\n" "$blob_hash" "$rel_path" >> dist_entries
+        done < <(find ./dist -type f -print0 | sort -z)
 
-        # Only proceed if there are changes
-        if git status --porcelain | grep -q '^'; then
-          # Create commit with all files
-          git commit -m "${{ inputs.commitMessage }}"
+        # Create dist tree
+        echo "Creating dist tree..."
+        DIST_TREE=$(cat dist_entries | git mktree)
+        echo "Dist tree: $DIST_TREE"
 
-          # Reset main branch to this new commit
-          echo "Updating ${{ github.ref_name }}..."
-          git push origin temp_branch:${{ github.ref_name }} --force
+        # Create root tree with proper spacing
+        echo "Creating root tree..."
+        printf "040000 tree %s\tdist\n100644 blob %s\tmanifest.json\n" "$DIST_TREE" "$MANIFEST_BLOB" | git mktree > root_tree
+        ROOT_TREE=$(cat root_tree)
+        echo "Root tree: $ROOT_TREE"
 
-          echo "Changes pushed successfully"
+        # Try to get parent commit
+        echo "Checking for parent commit..."
+        cd "${{ github.workspace }}"
+        PARENT=""
+        if git fetch origin "${{ github.ref_name }}" 2>/dev/null; then
+          PARENT=$(git rev-parse FETCH_HEAD)
+          echo "Found parent commit: $PARENT"
         else
-          echo "No changes to commit"
+          echo "No parent commit found, creating new history"
         fi
+        cd "$TEMP_DIR"
 
-        # Switch back and restore any stashed changes
-        git checkout "${{ github.ref_name }}"
-        git stash pop || true
+        # Create commit
+        echo "Creating commit..."
+        if [ -n "$PARENT" ]; then
+          COMMIT=$(echo "${{ inputs.commitMessage }}" | git commit-tree "$ROOT_TREE" -p "$PARENT")
+        else
+          COMMIT=$(echo "${{ inputs.commitMessage }}" | git commit-tree "$ROOT_TREE")
+        fi
+        echo "Created commit: $COMMIT"
+        
+        # Update the branch
+        echo "Pushing to ${{ github.ref_name }}..."
+        cd "${{ github.workspace }}"
+        git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+        git push origin "$COMMIT:refs/heads/${{ github.ref_name }}" --force
+
+        echo "Cleaning up..."
+        rm -rf "$TEMP_DIR"
+        echo "Done!"
