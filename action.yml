@@ -183,7 +183,7 @@ runs:
                 } catch (error) {
                   if (attempt === maxRetries) throw error;
                   const delayMs = Math.min(1000 * Math.pow(2, attempt), 10000);
-                  console.log(`Attempt ${attempt} failed, retrying in ${delayMs}ms...`);
+                  console.log('Attempt ' + attempt + ' failed, retrying in ' + delayMs + 'ms...');
                   await sleep(delayMs);
                 }
               }
@@ -252,12 +252,13 @@ runs:
                   treeEntryChunks.push(currentChunk);
                 }
 
-                console.log(`Splitting ${allTreeEntries.length} files into ${treeEntryChunks.length} chunks`);
+                console.log('Processing ' + allTreeEntries.length + ' files in ' + treeEntryChunks.length + ' chunks');
 
                 let currentTreeSha = currentCommit.data.object.sha;
                 for (let i = 0; i < treeEntryChunks.length; i++) {
                   const chunk = treeEntryChunks[i];
-                  console.log(`Processing chunk ${i + 1}/${treeEntryChunks.length} (${chunk.length} files)`);
+                  const chunkIndex = i + 1;
+                  console.log('Processing chunk ' + chunkIndex + ' of ' + treeEntryChunks.length + ' (' + chunk.length + ' files)');
                   
                   try {
                     const newTree = await retryWithBackoff(() => 
@@ -270,10 +271,14 @@ runs:
                     );
                     
                     currentTreeSha = newTree.data.sha;
-                    console.log(`Successfully processed chunk ${i + 1}`);
+                    console.log('Successfully processed chunk ' + chunkIndex);
                   } catch (error) {
-                    console.error(`Error processing chunk ${i + 1}:`, error);
-                    throw error; // Re-throw to trigger overall error handling
+                    if (error.message) {
+                      console.error('Error processing chunk ' + chunkIndex + ': ' + error.message);
+                    } else {
+                      console.error('Error processing chunk ' + chunkIndex + ': Unknown error');
+                    }
+                    throw error;
                   }
                 }
 
