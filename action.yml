@@ -156,91 +156,54 @@ runs:
         git config --global user.name "github-actions"
         git config --global user.email "github-actions@github.com"
 
+    - name: Install git-lfs
+      shell: bash
+      run: |
+        if ! command -v git-lfs &> /dev/null; then
+          curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+          sudo apt-get install git-lfs
+        fi
+
     - name: Update manifest.json and dist folder
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.get_installation_token.outputs.token || github.token }}
       run: |
-        # Create new empty directory
-        TEMP_DIR=$(mktemp -d)
-        cd "$TEMP_DIR"
-        
-        # Initialize git directory (not a repo)
-        mkdir .git
-        git init --bare
-        
-        # Ensure we exit on any error
-        set -e
-
-        # Helper functions
-        create_blob() {
-          local file="$1"
-          if [ ! -f "$file" ]; then
-            echo "Error: File not found - $file" >&2
-            return 1
-          fi
-          git hash-object -w "$file"
-        }
-
-        echo "Setting up git environment..."
-        mkdir -p .git/objects .git/refs
-
-        echo "Processing manifest file..."
-        MANIFEST_BLOB=$(create_blob "${{ github.workspace }}/${{ inputs.manifestPath }}")
-        echo "Manifest blob: $MANIFEST_BLOB"
-
-        # Create dist directory entries
-        echo "Processing dist files..."
-        mkdir -p dist
-        cp -r "${{ github.workspace }}/dist/"* dist/
-
-        # First create blobs for all dist files
-        echo "Creating file blobs..."
-        while IFS= read -r -d $'\0' file; do
-          rel_path="${file#./dist/}"
-          blob_hash=$(create_blob "$file")
-          # Use printf with tab delimiter to ensure proper spacing
-          printf "100644 blob %s\t%s\n" "$blob_hash" "$rel_path" >> dist_entries
-        done < <(find ./dist -type f -print0 | sort -z)
-
-        # Create dist tree
-        echo "Creating dist tree..."
-        DIST_TREE=$(cat dist_entries | git mktree)
-        echo "Dist tree: $DIST_TREE"
-
-        # Create root tree with proper spacing
-        echo "Creating root tree..."
-        printf "040000 tree %s\tdist\n100644 blob %s\tmanifest.json\n" "$DIST_TREE" "$MANIFEST_BLOB" | git mktree > root_tree
-        ROOT_TREE=$(cat root_tree)
-        echo "Root tree: $ROOT_TREE"
-
-        # Try to get parent commit
-        echo "Checking for parent commit..."
         cd "${{ github.workspace }}"
-        PARENT=""
-        if git fetch origin "${{ github.ref_name }}" 2>/dev/null; then
-          PARENT=$(git rev-parse FETCH_HEAD)
-          echo "Found parent commit: $PARENT"
-        else
-          echo "No parent commit found, creating new history"
-        fi
-        cd "$TEMP_DIR"
-
-        # Create commit
-        echo "Creating commit..."
-        if [ -n "$PARENT" ]; then
-          COMMIT=$(echo "${{ inputs.commitMessage }}" | git commit-tree "$ROOT_TREE" -p "$PARENT")
-        else
-          COMMIT=$(echo "${{ inputs.commitMessage }}" | git commit-tree "$ROOT_TREE")
-        fi
-        echo "Created commit: $COMMIT"
         
-        # Update the branch
-        echo "Pushing to ${{ github.ref_name }}..."
-        cd "${{ github.workspace }}"
+        # Configure git
         git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-        git push origin "$COMMIT:refs/heads/${{ github.ref_name }}" --force
-
-        echo "Cleaning up..."
-        rm -rf "$TEMP_DIR"
-        echo "Done!"
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        
+        # Initialize Git LFS
+        git lfs install
+        
+        # Setup Git LFS tracking for large files
+        git lfs track "dist/**/*.js"
+        git lfs track "dist/**/*.map"
+        git add .gitattributes
+        
+        # Stage and commit the manifest file separately
+        git add "${{ inputs.manifestPath }}"
+        git commit -m "chore: update manifest.json"
+        
+        # Stage and commit dist files in chunks
+        echo "Adding dist files..."
+        mkdir -p dist
+        
+        # Add dist files in smaller chunks
+        find dist -type f -name "*.js" -o -name "*.map" | while read file; do
+          git add "$file"
+          # Commit every few files to avoid large trees
+          if [ $(git status --porcelain | wc -l) -ge 10 ]; then
+            git commit -m "chore: add dist files (chunk)"
+          fi
+        done
+        
+        # Commit any remaining files
+        git status --porcelain | grep -q . && git commit -m "chore: add remaining dist files"
+        
+        # Push all changes
+        echo "Pushing changes to ${{ github.ref_name }}..."
+        git push origin HEAD:${{ github.ref_name }}
